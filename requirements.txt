@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+mangum
+sqlalchemy
+aiomysql
+pydantic
+python-dotenv
+pytest
+pytest-asyncio
+httpx
+pytest-mock
