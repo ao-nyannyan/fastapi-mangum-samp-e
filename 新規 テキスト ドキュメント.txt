@@ -1,0 +1,100 @@
+# repository.py
+from __future__ import annotations
+from typing import Any, Generic, Iterable, Sequence, TypeVar
+from sqlalchemy import select, update as sa_update, delete as sa_delete, insert as sa_insert, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
+
+T = TypeVar("T")  # SQLAlchemy Model
+
+class CRUDMixin(Generic[T]):
+    model: type[T]
+
+    # ---- R ----
+    async def get(self, session: AsyncSession, pk: Any) -> T | None:
+        return await session.get(self.model, pk)
+
+    async def exists(self, session: AsyncSession, **filters) -> bool:
+        stmt = select(func.count("*")).select_from(self.model).filter_by(**filters)
+        res = await session.execute(stmt)
+        return res.scalar_one() > 0
+
+    async def list(
+        self,
+        session: AsyncSession,
+        *,
+        where: dict[str, Any] | None = None,
+        order_by: Sequence[InstrumentedAttribute] | None = None,
+        limit: int | None = 100,
+        offset: int | None = 0,
+    ) -> list[T]:
+        stmt = select(self.model)
+        if where:
+            stmt = stmt.filter_by(**where)
+        if order_by:
+            stmt = stmt.order_by(*order_by)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        if offset:
+            stmt = stmt.offset(offset)
+        rows = (await session.execute(stmt)).scalars().all()
+        return list(rows)
+
+    # ---- C ----
+    async def create(self, session: AsyncSession, data: dict[str, Any]) -> T:
+        obj = self.model(**data)  # type: ignore[arg-type]
+        session.add(obj)
+        await session.flush()  # id など取得
+        return obj
+
+    async def bulk_create(
+        self,
+        session: AsyncSession,
+        rows: Iterable[dict[str, Any]],
+        *,
+        return_created: bool = False,
+    ) -> list[T] | int:
+        rows = list(rows)
+        if not rows:
+            return [] if return_created else 0
+        # insert … values 形式（最速は LOAD DATA だけどSQLAではこれが実用的）
+        stmt = sa_insert(self.model)
+        if return_created:
+            stmt = stmt.returning(self.model)  # PostgreSQL 向け。MySQLはRETURNING未対応（8.0.19+でも制限大）
+            res = await session.execute(stmt, rows)
+            return list(res.scalars().all())
+        else:
+            await session.execute(stmt, rows)
+            return len(rows)
+
+    # ---- U ----
+    async def update(self, session: AsyncSession, pk: Any, data: dict[str, Any]) -> T | None:
+        obj = await self.get(session, pk)
+        if not obj:
+            return None
+        for k, v in data.items():
+            setattr(obj, k, v)
+        await session.flush()
+        return obj
+
+    async def update_where(self, session: AsyncSession, where: dict[str, Any], data: dict[str, Any]) -> int:
+        stmt = sa_update(self.model).where(*(getattr(self.model, k) == v for k, v in where.items())).values(**data)
+        res = await session.execute(stmt)
+        return res.rowcount or 0
+
+    # ---- D ----
+    async def delete(self, session: AsyncSession, pk: Any) -> bool:
+        stmt = sa_delete(self.model).where(getattr(self.model, "id") == pk)
+        res = await session.execute(stmt)
+        return (res.rowcount or 0) > 0
+
+    async def count(self, session: AsyncSession, **filters) -> int:
+        stmt = select(func.count("*")).select_from(self.model)
+        if filters:
+            stmt = stmt.filter_by(**filters)
+        res = await session.execute(stmt)
+        return int(res.scalar_one())
+
+class BaseRepository(CRUDMixin[T], Generic[T]):
+    def __init__(self, model: type[T]) -> None:
+        self.model = model
