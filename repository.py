@@ -210,7 +210,7 @@ class BaseRepository(Generic[T]):
 
 from sqlalchemy import select, func, delete as sa_delete, update as sa_update, case
 
-    async def bulk_update_entities(
+ async def bulk_update_entities(
         self,
         session: AsyncSession,
         entities: Iterable[T],
@@ -222,14 +222,13 @@ from sqlalchemy import select, func, delete as sa_delete, update as sa_update, c
         モデルのリストを一括更新（部分更新）。
         - 単一PK前提（全エンティティに PK がセットされていること）
         - 更新対象列は `fields` で指定（PKは自動除外）
-        - 大量件数は `chunk_size` で分割して UPDATE ... CASE で高速更新
-        戻り値: 更新件数（ベストエフォート。MySQLのsafe-updates設定等に影響されることあり）
+        - 大量件数は `chunk_size` で分割し、UPDATE ... CASE で高速更新
+        戻り値: 更新件数（同値更新は rowcount に含まれない場合あり）
         """
         items = [e for e in entities]
         if not items:
             return 0
 
-        # 単一PKチェック
         mapper = sa_inspect(self.model).mapper
         pk_cols = list(mapper.primary_key)
         if len(pk_cols) != 1:
@@ -237,15 +236,13 @@ from sqlalchemy import select, func, delete as sa_delete, update as sa_update, c
         pk_col = pk_cols[0]
         pk_name = pk_col.key
 
-        # 反映列（PKは除外）
         if not fields:
             raise ValueError("bulk_update_entities(): 'fields' must not be empty")
         target_fields = set(fields)
         target_fields.discard(pk_name)
         if not target_fields:
-            return 0  # 更新対象なし
+            return 0
 
-        # 各エンティティの PK と列値を抽出
         def extract_row(e: T) -> tuple[Any, dict[str, Any]]:
             inst = sa_inspect(e)
             pk_val = getattr(e, pk_name, None)
@@ -257,16 +254,21 @@ from sqlalchemy import select, func, delete as sa_delete, update as sa_update, c
         rows = [extract_row(e) for e in items]
         total_updated = 0
 
-        # チャンクで一括 UPDATE
+        # チャンクごとに 1 本の UPDATE … SET col = CASE pk WHEN ... END, ...
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i : i + chunk_size]
             ids = [r[0] for r in chunk]
 
-            # col ごとに CASE 式を用意： col = CASE pk WHEN id1 THEN v1 WHEN id2 THEN v2 ... ELSE col END
             values_dict: dict[str, Any] = {}
+            # SQLAlchemy 2.x の case(): (cond, then) タプルを *args で渡す
             for col in target_fields:
-                whens = {pid: pdata[col] for (pid, pdata) in chunk}
-                values_dict[col] = case(pk_col, whens=whens, else_=getattr(self.model, col))
+                when_pairs = [  # [(pk_col == id, value), ...]
+                    (pk_col == pid, pdata[col]) for (pid, pdata) in chunk
+                ]
+                values_dict[col] = case(
+                    *when_pairs,
+                    else_=getattr(self.model, col)
+                )
 
             stmt = (
                 sa_update(self.model)
@@ -276,6 +278,5 @@ from sqlalchemy import select, func, delete as sa_delete, update as sa_update, c
             res = await session.execute(stmt)
             total_updated += res.rowcount or 0
 
-        # ORM側のインスタンスへはDBの更新を“確定させる”だけ（値反映はexpire/refreshを呼び出し側で）
         await session.flush()
         return int(total_updated)
