@@ -152,35 +152,40 @@ class BaseRepository(Generic[T]):
     ) -> T:
         """
         既存行を、渡したエンティティの値で部分更新。
-        - PK必須
+        - 単一PK/複合PK どちらも対応
         - fields 指定でそのカラムのみ反映（Noneなら全カラム）
+        - PK列は自動的に更新対象から除外
         """
         inst = sa_inspect(entity)
-        # PK 取得
-        pk_cols = inst.mapper.primary_key
-        if len(pk_cols) != 1:
-            raise ValueError("update_entity(): composite primary key is not supported")
-        pk_name = pk_cols[0].key
-        pk_val = getattr(entity, pk_name, None)
-        if pk_val is None:
-            raise ValueError("update_entity(): primary key value is required on entity")
+        mapper = inst.mapper
 
-        # 既存行取得
-        current = await session.get(self.model, pk_val)
+        # --- PK 名と値を抽出（順序は mapper.primary_key の順） ---
+        pk_cols = list(mapper.primary_key)
+        pk_names = [c.key for c in pk_cols]
+        pk_values = []
+        for c in pk_cols:
+            v = getattr(entity, c.key, None)
+            if v is None:
+                raise ValueError(f"update_entity(): primary key '{c.key}' must be set on entity")
+            pk_values.append(v)
+
+        # AsyncSession.get は 複合PKでも (v1, v2, ...) のタプルで取得可能
+        pk_identity = pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+        current = await session.get(self.model, pk_identity)
         if current is None:
-            raise ValueError(f"update_entity(): entity not found (pk={pk_val!r})")
+            raise ValueError(f"update_entity(): entity not found (pk={pk_identity!r})")
 
-        # 反映対象カラム
-        col_names = [c.key for c in inst.mapper.columns]
-        target_fields = set(col_names) if fields is None else set(fields)
-        if pk_name in target_fields:
-            target_fields.remove(pk_name)
+        # 反映対象の列名を決定（PKは除外）
+        all_cols = [c.key for c in mapper.columns]
+        target_fields = set(all_cols) if fields is None else set(fields)
+        target_fields.difference_update(pk_names)
 
-        for k in target_fields:
-            setattr(current, k, getattr(entity, k))
+        # 値を反映
+        for name in target_fields:
+            setattr(current, name, getattr(entity, name))
+
         await session.flush()
         return current
-
     async def bulk_create(self, session: AsyncSession, models: Iterable[T]) -> int:
         """
         複数モデルの一括作成（全て transient を想定）。
